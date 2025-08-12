@@ -18,8 +18,7 @@ use-default-preprocessors = true
 [preprocessor.links]
 
 [output.html]
-default-theme = "navy"
-preferred-dark-theme = "navy"
+additional-css = ["theme.css"]
 smart-punctuation = true
 mathjax-support = false
 copy-fonts = true

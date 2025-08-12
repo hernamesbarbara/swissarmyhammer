@@ -116,7 +116,7 @@ impl GitOperations {
     /// 1. If already on the target branch, return success (resume scenario)
     /// 2. If switching to existing branch, must be on main branch first
     /// 3. If creating new branch, must be on main branch
-    /// 4. Returns ABORT ERROR if branching rules are violated
+    /// 4. Returns error if branching rules are violated
     pub fn create_work_branch(&self, issue_name: &str) -> Result<String> {
         let branch_name = format!("issue/{issue_name}");
         let current_branch = self.current_branch()?;
@@ -153,9 +153,13 @@ impl GitOperations {
         // If not on main branch, check what operation is being attempted
         if current_branch != main_branch {
             if self.branch_exists(target_branch)? {
-                return Err(SwissArmyHammerError::cannot_switch_issue_to_issue());
+                return Err(SwissArmyHammerError::Other(
+                    "Cannot switch to issue branch from another issue branch. Please switch to main first.".to_string()
+                ));
             } else {
-                return Err(SwissArmyHammerError::cannot_create_issue_from_issue());
+                return Err(SwissArmyHammerError::Other(
+                    "Cannot create new issue branch from another issue branch. Must be on main branch.".to_string()
+                ));
             }
         }
         Ok(())
@@ -624,17 +628,14 @@ mod tests {
         // Create and switch to first issue branch
         git_ops.create_work_branch("issue_001").unwrap();
 
-        // Try to create another work branch while on an issue branch - should return ABORT ERROR
+        // Try to create another work branch while on an issue branch - should return error
         let result = git_ops.create_work_branch("issue_002");
         assert!(result.is_err());
         let error = result.unwrap_err();
 
-        // Verify it's an ABORT ERROR with correct message content
-        assert!(error.is_abort_error());
-        assert_eq!(
-            error.to_string(),
-            SwissArmyHammerError::CANNOT_CREATE_ISSUE_FROM_ISSUE
-        );
+        // Verify it's an error with correct message content
+        let error_msg = error.to_string();
+        assert!(error_msg.contains("Cannot create new issue branch from another issue branch"));
     }
 
     #[test]
@@ -685,40 +686,14 @@ mod tests {
             .unwrap();
         git_ops.create_work_branch("issue_002").unwrap();
 
-        // Now try to switch to first branch while on second branch - should return ABORT ERROR
+        // Now try to switch to first branch while on second branch - should return error
         let result = git_ops.create_work_branch("issue_001");
         assert!(result.is_err());
         let error = result.unwrap_err();
 
-        // Verify it's an ABORT ERROR with correct message content
-        assert!(error.is_abort_error());
-        assert_eq!(
-            error.to_string(),
-            SwissArmyHammerError::CANNOT_SWITCH_ISSUE_TO_ISSUE
-        );
-    }
-
-    #[test]
-    fn test_abort_error_helper_methods() {
-        // Test is_abort_error() and abort_error_message() methods
-        let abort_error = SwissArmyHammerError::cannot_create_issue_from_issue();
-        assert!(abort_error.is_abort_error());
-        assert_eq!(
-            abort_error.abort_error_message().unwrap(),
-            SwissArmyHammerError::CANNOT_CREATE_ISSUE_FROM_ISSUE
-        );
-
-        let switch_error = SwissArmyHammerError::cannot_switch_issue_to_issue();
-        assert!(switch_error.is_abort_error());
-        assert_eq!(
-            switch_error.abort_error_message().unwrap(),
-            SwissArmyHammerError::CANNOT_SWITCH_ISSUE_TO_ISSUE
-        );
-
-        // Test non-abort error
-        let regular_error = SwissArmyHammerError::Other("regular error".to_string());
-        assert!(!regular_error.is_abort_error());
-        assert!(regular_error.abort_error_message().is_none());
+        // Verify it's an error with correct message content
+        let error_msg = error.to_string();
+        assert!(error_msg.contains("Cannot switch to issue branch from another issue branch"));
     }
 
     #[test]

@@ -37,11 +37,19 @@ pub async fn run_prompt_command(subcommand: PromptSubcommand) -> CliResult<()> {
                 save,
                 debug,
             };
-            runner
-                .run(config)
-                .await
-                .map(|_| ())
-                .map_err(|e| CliError::new(e.to_string(), 1))
+            runner.run(config).await.map(|_| ()).map_err(|e| {
+                // Check if the underlying error is a SwissArmyHammerError with abort
+                if let Some(swissarmyhammer::SwissArmyHammerError::ExecutorError(
+                    swissarmyhammer::workflow::ExecutorError::Abort(abort_reason),
+                )) = e.downcast_ref::<swissarmyhammer::SwissArmyHammerError>()
+                {
+                    return CliError::new(
+                        format!("Prompt execution aborted: {abort_reason}"),
+                        crate::exit_codes::EXIT_ERROR,
+                    );
+                }
+                CliError::new(e.to_string(), 1)
+            })
         }
         PromptSubcommand::Search {
             query,

@@ -8,17 +8,12 @@
 - Common configuration (linting, profiles) shared across workspace
 
 **Layered Architecture**
-- **Library Core** (`swissarmyhammer/`): Business logic, storage, templates, workflows
+- **Library Core** (`swissarmyhammer/`): Business logic, storage, templates, workflows, MCP Tools
 - **CLI Layer** (`swissarmyhammer-cli/`): Command-line interface, argument parsing, user interaction
 - **Documentation** (`doc/`): mdBook-based documentation with examples
 - **Testing** (`tests/`): Integration tests at workspace level
 
 ## Module Organization Patterns
-
-**Domain-Driven Structure**
-- Core modules organized by domain: `prompts`, `workflow`, `issues`, `memoranda`
-- Cross-cutting concerns: `error`, `config`, `security`, `validation`
-- Infrastructure modules: `storage`, `mcp`, `file_loader`, `search`
 
 **Common Utilities Pattern**
 - `common/` module with shared utilities: `error_context`, `file_types`, `validation_builders`

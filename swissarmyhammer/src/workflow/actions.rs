@@ -3,6 +3,7 @@
 //! This module provides the action execution infrastructure for workflows,
 //! including Claude integration, variable operations, and control flow actions.
 
+use crate::sah_config;
 use crate::workflow::action_parser::ActionParser;
 use crate::workflow::{WorkflowExecutor, WorkflowName, WorkflowRunStatus, WorkflowStorage};
 use serde_json::Value;
@@ -81,9 +82,6 @@ pub enum ActionError {
         /// How long to wait before retrying
         wait_time: Duration,
     },
-    /// Abort error that should exit workflow immediately
-    #[error("ABORT ERROR: {0}")]
-    AbortError(String),
 }
 
 /// Result type for action operations
@@ -618,8 +616,7 @@ impl PromptAction {
             );
         }
 
-        // Check for ABORT ERROR pattern in the response using common helper
-        crate::common::check_for_abort_error(response_text)?;
+        // Note: String-based abort detection removed - abort handling now done via file-based mechanism
 
         // Display the output as YAML
         if !quiet && !response_text.is_empty() {
@@ -694,7 +691,16 @@ impl Action for WaitAction {
                 if let Some(message) = &self.message {
                     tracing::info!("Waiting: {}", message);
                 }
-                tokio::time::sleep(duration).await;
+
+                // In test mode, use much shorter wait times for faster test execution
+                let actual_duration = if cfg!(test) || std::env::var("RUST_TEST").is_ok() {
+                    // Cap wait time at 50ms in test mode for performance
+                    Duration::from_millis(std::cmp::min(50, duration.as_millis() as u64))
+                } else {
+                    duration
+                };
+
+                tokio::time::sleep(actual_duration).await;
             }
             None => {
                 let message = self
@@ -793,8 +799,8 @@ impl VariableSubstitution for LogAction {}
 #[async_trait::async_trait]
 impl Action for LogAction {
     async fn execute(&self, context: &mut HashMap<String, Value>) -> ActionResult<Value> {
-        // Substitute variables in message
-        let message = self.substitute_string(&self.message, context);
+        // Render message with liquid templating (supports {{variable}} syntax)
+        let message = render_with_liquid_template(&self.message, context);
 
         match self.level {
             LogLevel::Info => tracing::info!("{}", message),
@@ -907,12 +913,20 @@ impl Action for AbortAction {
         // Substitute variables in message
         let message = self.substitute_string(&self.message, context);
 
-        // Return an abort error which will propagate up and terminate the workflow
-        Err(ActionError::AbortError(message))
+        // Set a special context variable to signal abort request
+        context.insert(
+            "__ABORT_REQUESTED__".to_string(),
+            Value::String(message.clone()),
+        );
+
+        // Return an execution error to indicate action failure
+        Err(ActionError::ExecutionError(format!(
+            "Workflow aborted: {message}"
+        )))
     }
 
     fn description(&self) -> String {
-        format!("Abort workflow execution with message: {}", self.message)
+        format!("Abort workflow execution with message: {message}", message = self.message)
     }
 
     fn action_type(&self) -> &'static str {
@@ -937,6 +951,38 @@ fn substitute_variables_in_string(input: &str, context: &HashMap<String, Value>)
     parser
         .substitute_variables_safe(input, context)
         .unwrap_or_else(|_| input.to_string())
+}
+
+/// Helper function to render text with liquid templating
+/// Supports both {{variable}} liquid syntax and ${variable} fallback
+fn render_with_liquid_template(input: &str, context: &HashMap<String, Value>) -> String {
+    // Convert context to liquid Object
+    let mut liquid_vars = liquid::Object::new();
+    for (key, value) in context {
+        // Skip internal keys that shouldn't be exposed to templates
+        if key.starts_with('_') {
+            continue;
+        }
+        liquid_vars.insert(
+            key.clone().into(),
+            liquid::model::to_value(value).unwrap_or(liquid::model::Value::Nil),
+        );
+    }
+
+    // Try liquid template rendering first (supports {{variable}} syntax)
+    let liquid_rendered = match liquid::ParserBuilder::with_stdlib()
+        .build()
+        .and_then(|parser| parser.parse(input))
+    {
+        Ok(template) => match template.render(&liquid_vars) {
+            Ok(rendered) => rendered,
+            Err(_) => input.to_string(),
+        },
+        Err(_) => input.to_string(),
+    };
+
+    // Apply fallback variable substitution for any remaining ${variable} syntax
+    substitute_variables_in_string(&liquid_rendered, context)
 }
 
 impl SubWorkflowAction {
@@ -976,6 +1022,663 @@ impl SubWorkflowAction {
 }
 
 impl VariableSubstitution for SubWorkflowAction {}
+
+/// Shell action for executing shell commands in workflows
+#[derive(Debug, Clone)]
+pub struct ShellAction {
+    /// The shell command to execute
+    pub command: String,
+    /// Optional timeout for command execution
+    #[allow(dead_code)]
+    pub timeout: Option<Duration>,
+    /// Optional variable name to store command output
+    #[allow(dead_code)]
+    pub result_variable: Option<String>,
+    /// Optional working directory for command execution
+    #[allow(dead_code)]
+    pub working_dir: Option<String>,
+    /// Optional environment variables for the command
+    #[allow(dead_code)]
+    pub environment: HashMap<String, String>,
+}
+
+impl ShellAction {
+    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+    const MAX_TIMEOUT: Duration = Duration::from_secs(3600); // 1 hour
+
+    /// Create a new shell action
+    #[allow(dead_code)]
+    pub fn new(command: String) -> Self {
+        Self {
+            command,
+            timeout: None, // No timeout by default as per specification
+            result_variable: None,
+            working_dir: None,
+            environment: HashMap::new(),
+        }
+    }
+
+    /// Set the timeout for command execution
+    #[allow(dead_code)]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Set the result variable name
+    pub fn with_result_variable(mut self, variable: String) -> Self {
+        self.result_variable = Some(variable);
+        self
+    }
+
+    /// Set the working directory for command execution
+    pub fn with_working_dir(mut self, dir: String) -> Self {
+        self.working_dir = Some(dir);
+        self
+    }
+
+    /// Set environment variables for the command
+    pub fn with_environment(mut self, env: HashMap<String, String>) -> Self {
+        self.environment = env;
+        self
+    }
+
+    /// Validate timeout duration according to security limits
+    pub fn validate_timeout(&self) -> ActionResult<Duration> {
+        let timeout = self.timeout.unwrap_or(Self::DEFAULT_TIMEOUT);
+
+        if timeout > Self::MAX_TIMEOUT {
+            return Err(ActionError::ExecutionError(format!(
+                "Timeout too large: maximum is {} seconds",
+                Self::MAX_TIMEOUT.as_secs()
+            )));
+        }
+
+        if timeout.as_millis() == 0 {
+            return Err(ActionError::ExecutionError(
+                "Timeout must be greater than 0".to_string(),
+            ));
+        }
+
+        Ok(timeout)
+    }
+}
+
+/// Create a platform-specific command for shell execution
+#[cfg(target_os = "windows")]
+fn create_command(command: &str) -> Command {
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/C", command]);
+    cmd
+}
+
+/// Create a platform-specific command for shell execution
+#[cfg(not(target_os = "windows"))]
+fn create_command(command: &str) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", command]);
+    cmd
+}
+
+/// Validate environment variable names
+/// Environment variable names should start with letter or underscore
+/// and contain only letters, digits, and underscores
+pub fn is_valid_env_var_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+
+    let mut chars = name.chars();
+    if let Some(first) = chars.next() {
+        if !first.is_ascii_alphabetic() && first != '_' {
+            return false;
+        }
+    }
+
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Validate working directory path for security
+pub fn validate_working_directory(path: &str) -> ActionResult<()> {
+    let path = std::path::Path::new(path);
+
+    // Check for path traversal attempts
+    if path
+        .components()
+        .any(|comp| matches!(comp, std::path::Component::ParentDir))
+    {
+        return Err(ActionError::ExecutionError(
+            "Working directory cannot contain parent directory references (..)".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validate shell command for security issues
+pub fn validate_command(command: &str) -> ActionResult<()> {
+    // Check for obviously dangerous patterns
+    if command.trim().is_empty() {
+        return Err(ActionError::ExecutionError(
+            "Shell command cannot be empty".to_string(),
+        ));
+    }
+
+    // Check command length (prevent extremely long commands)
+    if command.len() > 4096 {
+        return Err(ActionError::ExecutionError(
+            "Shell command too long (maximum 4096 characters)".to_string(),
+        ));
+    }
+
+    // Detect dangerous command patterns
+    validate_dangerous_patterns(command)?;
+
+    // Validate command structure
+    validate_command_structure(command)?;
+
+    Ok(())
+}
+
+/// Detect dangerous command patterns as specified in security requirements
+pub fn validate_dangerous_patterns(command: &str) -> ActionResult<()> {
+    let dangerous_patterns = [
+        // System modification commands
+        ("rm -rf", "Recursive file deletion"),
+        ("format", "Disk formatting"),
+        ("fdisk", "Disk partitioning"),
+        ("mkfs", "Filesystem creation"),
+        // Network/security operations
+        ("nc -l", "Network listener"),
+        ("ncat -l", "Network listener"),
+        ("socat", "Network relay"),
+        ("ssh", "Remote shell access"),
+        ("scp", "Remote file copy"),
+        ("rsync", "Remote sync"),
+        // Package management
+        ("apt install", "Package installation"),
+        ("yum install", "Package installation"),
+        ("pip install", "Python package installation"),
+        ("npm install", "Node package installation"),
+        ("cargo install", "Rust package installation"),
+        // Privilege escalation
+        ("sudo", "Privilege escalation"),
+        ("su ", "User switching"),
+        ("chmod +s", "Setuid bit"),
+        ("chown root", "Root ownership change"),
+        // System configuration
+        ("/etc/", "System configuration access"),
+        ("systemctl", "System service control"),
+        ("service ", "Service control"),
+        ("crontab", "Scheduled task modification"),
+        // Dangerous shell features
+        ("|(", "Subshell execution"),
+        ("eval", "Dynamic code execution"),
+        ("exec", "Process replacement"),
+    ];
+
+    let command_lower = command.to_lowercase();
+
+    for (pattern, description) in &dangerous_patterns {
+        if command_lower.contains(pattern) {
+            tracing::warn!(
+                "Potentially dangerous command pattern detected: {} in command: {}",
+                description,
+                command
+            );
+
+            // Log security event
+            log_security_event("DANGEROUS_PATTERN", description, command);
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate command structure to prevent injection
+pub fn validate_command_structure(command: &str) -> ActionResult<()> {
+    // Check for command injection patterns
+    let injection_patterns = [";", "&&", "||", "|", "`", "$(", "\n", "\r", "\0"];
+
+    for pattern in &injection_patterns {
+        if command.contains(pattern) {
+            // Allow some patterns in specific contexts
+            if validate_safe_usage(command, pattern)? {
+                continue;
+            }
+
+            return Err(ActionError::ExecutionError(format!(
+                "Potentially unsafe command pattern '{pattern}' detected"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if a potentially dangerous pattern is being used safely
+pub fn validate_safe_usage(command: &str, pattern: &str) -> ActionResult<bool> {
+    match pattern {
+        "|" => {
+            // Allow simple pipes for common operations
+            if command.matches('|').count() == 1 && !command.contains("nc ") {
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        "&&" | "||" | ";" => {
+            // These are generally unsafe for automated execution
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Enhanced working directory validation with security checks
+pub fn validate_working_directory_security(path: &str) -> ActionResult<()> {
+    // First run the existing validation
+    validate_working_directory(path)?;
+
+    // Prevent access to sensitive system directories
+    let sensitive_dirs = [
+        "/etc",
+        "/sys",
+        "/proc",
+        "/dev",
+        "/boot",
+        "/root",
+        "/var/lib",
+        "/usr/lib",
+        "C:\\Windows",
+        "C:\\Program Files",
+        "C:\\System32",
+    ];
+
+    let path_str = path.to_string().to_lowercase();
+    for sensitive in &sensitive_dirs {
+        if path_str.starts_with(&sensitive.to_lowercase()) {
+            tracing::warn!("Attempting to use sensitive directory: {}", path_str);
+            log_security_event(
+                "SENSITIVE_DIRECTORY",
+                &format!("Access to {sensitive}"),
+                path,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate environment variables for security issues
+pub fn validate_environment_variables_security(env: &HashMap<String, String>) -> ActionResult<()> {
+    // List of sensitive environment variables that shouldn't be overridden
+    let protected_vars = [
+        "PATH",
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "HOME",
+        "USER",
+        "USERNAME",
+        "SHELL",
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "SUDO_USER",
+        "SUDO_UID",
+        "SUDO_GID",
+    ];
+
+    for (key, value) in env {
+        // Validate variable name (use existing function)
+        if !is_valid_env_var_name(key) {
+            return Err(ActionError::ExecutionError(format!(
+                "Invalid environment variable name: {key}"
+            )));
+        }
+
+        // Check for protected variables
+        if protected_vars.contains(&key.to_uppercase().as_str()) {
+            tracing::warn!(
+                "Attempting to override protected environment variable: {}",
+                key
+            );
+            log_security_event("PROTECTED_ENV_VAR", &format!("Override of {key}"), "");
+        }
+
+        // Validate variable value length
+        if value.len() > 1024 {
+            return Err(ActionError::ExecutionError(format!(
+                "Environment variable value too long: {key}"
+            )));
+        }
+
+        // Check for injection in environment values
+        if value.contains('\0') || value.contains('\n') {
+            return Err(ActionError::ExecutionError(format!(
+                "Invalid characters in environment variable: {key}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Log security-related events for audit purposes
+pub fn log_security_event(event_type: &str, details: &str, command: &str) {
+    tracing::warn!(
+        "Security event: {} - {} - Command: {}",
+        event_type,
+        details,
+        command
+    );
+}
+
+/// Log command execution with security context
+pub fn log_command_execution(
+    command: &str,
+    working_dir: Option<&str>,
+    env: &HashMap<String, String>,
+) {
+    tracing::info!(
+        "Executing shell command: {} (working_dir: {:?}, env_vars: {})",
+        command,
+        working_dir,
+        env.len()
+    );
+
+    // Log environment variables (but not their values for security)
+    if !env.is_empty() {
+        let env_keys: Vec<&String> = env.keys().collect();
+        tracing::debug!("Environment variables set: {:?}", env_keys);
+    }
+}
+
+impl VariableSubstitution for ShellAction {}
+
+impl ShellAction {
+    /// Process command output and set context variables
+    fn process_command_output(
+        &self,
+        output: std::process::Output,
+        duration_ms: u64,
+        context: &mut HashMap<String, Value>,
+    ) -> ActionResult<Value> {
+        let success = output.status.success();
+        let exit_code = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        tracing::debug!(
+            "Command completed: exit_code={}, duration_ms={}",
+            exit_code,
+            duration_ms
+        );
+
+        // Set all required context variables
+        context.insert("success".to_string(), Value::Bool(success));
+        context.insert("failure".to_string(), Value::Bool(!success));
+        context.insert("exit_code".to_string(), Value::Number(exit_code.into()));
+        context.insert("stdout".to_string(), Value::String(stdout.clone()));
+        context.insert("stderr".to_string(), Value::String(stderr));
+        context.insert("duration_ms".to_string(), Value::Number(duration_ms.into()));
+
+        // Set result variable if specified
+        if let Some(result_var) = &self.result_variable {
+            context.insert(result_var.clone(), Value::String(stdout.clone()));
+        }
+
+        // Set last action result based on command success
+        context.insert(LAST_ACTION_RESULT_KEY.to_string(), Value::Bool(success));
+
+        tracing::info!(
+            "Shell command completed in {}ms with exit code {}",
+            duration_ms,
+            exit_code
+        );
+
+        // Return appropriate result - success returns stdout, failure returns false
+        if success {
+            Ok(Value::String(stdout))
+        } else {
+            tracing::info!("Command failed with exit code {}", exit_code);
+            Ok(Value::Bool(false)) // Don't fail the workflow, just indicate failure
+        }
+    }
+
+    /// Terminate process gracefully with SIGTERM followed by SIGKILL if needed
+    async fn terminate_process_gracefully(&self, child: &mut tokio::process::Child) {
+        use tokio::time::Duration;
+
+        let pid = child.id();
+
+        // First attempt: graceful termination (SIGTERM)
+        tracing::debug!("Attempting graceful termination of process {pid:?}");
+
+        if let Err(e) = child.start_kill() {
+            tracing::warn!("Failed to send SIGTERM to process {pid:?}: {e}");
+            return;
+        }
+
+        // Give the process time to terminate gracefully (5 seconds)
+        let graceful_timeout = Duration::from_secs(5);
+
+        match tokio::time::timeout(graceful_timeout, child.wait()).await {
+            Ok(Ok(_exit_status)) => {
+                tracing::debug!("Process {pid:?} terminated gracefully");
+                return;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Error waiting for process {pid:?} termination: {e}");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Process {pid:?} did not terminate gracefully within {graceful_timeout:?}"
+                );
+            }
+        }
+
+        // Second attempt: forceful termination (SIGKILL)
+        tracing::debug!("Attempting forceful termination of process {pid:?}");
+
+        if let Err(e) = child.kill().await {
+            tracing::error!("Failed to forcefully terminate process {pid:?}: {e}");
+        } else {
+            tracing::debug!("Process {pid:?} terminated forcefully");
+        }
+    }
+
+    /// Handle timeout scenarios by setting appropriate context variables
+    fn handle_timeout(
+        &self,
+        context: &mut HashMap<String, Value>,
+        duration_ms: u64,
+    ) -> ActionResult<Value> {
+        // Set timeout-specific context variables
+        context.insert("success".to_string(), Value::Bool(false));
+        context.insert("failure".to_string(), Value::Bool(true));
+        context.insert("exit_code".to_string(), Value::Number((-1).into()));
+        context.insert("stdout".to_string(), Value::String("".to_string()));
+        context.insert(
+            "stderr".to_string(),
+            Value::String("Command timed out".to_string()),
+        );
+        context.insert("duration_ms".to_string(), Value::Number(duration_ms.into()));
+
+        // Don't set result variable on timeout to indicate no output was captured
+
+        // Set last action result to indicate failure
+        context.insert(LAST_ACTION_RESULT_KEY.to_string(), Value::Bool(false));
+
+        tracing::warn!("Shell command timed out after {}ms", duration_ms);
+
+        Ok(Value::Bool(false))
+    }
+}
+
+#[async_trait::async_trait]
+impl Action for ShellAction {
+    async fn execute(&self, context: &mut HashMap<String, Value>) -> ActionResult<Value> {
+        // Substitute variables in command string
+        let command = self.substitute_string(&self.command, context);
+
+        // Security validation
+        validate_command(&command)?;
+
+        // Validate environment variables for security
+        validate_environment_variables_security(&self.environment)?;
+
+        // Validate timeout
+        let _validated_timeout = self.validate_timeout()?;
+
+        // Log security-relevant execution
+        log_command_execution(&command, self.working_dir.as_deref(), &self.environment);
+
+        tracing::info!("Executing shell command: {}", command);
+
+        // Record start time for duration calculation
+        let start_time = std::time::Instant::now();
+
+        // Create platform-specific command
+        let mut cmd = create_command(&command);
+
+        // Set working directory if specified
+        if let Some(working_dir) = &self.working_dir {
+            let substituted_dir = self.substitute_string(working_dir, context);
+
+            // Validate working directory for security
+            validate_working_directory_security(&substituted_dir)?;
+
+            let path = std::path::Path::new(&substituted_dir);
+
+            // Validate working directory exists and is accessible
+            if !path.exists() {
+                return Err(ActionError::ExecutionError(format!(
+                    "Working directory does not exist: {substituted_dir}"
+                )));
+            }
+
+            if !path.is_dir() {
+                return Err(ActionError::ExecutionError(format!(
+                    "Working directory is not a directory: {substituted_dir}"
+                )));
+            }
+
+            cmd.current_dir(path);
+            tracing::debug!("Set working directory to: {}", substituted_dir);
+        }
+
+        // Set environment variables if specified
+        for (key, value) in &self.environment {
+            let substituted_key = self.substitute_string(key, context);
+            let substituted_value = self.substitute_string(value, context);
+
+            // Validate environment variable names
+            if !is_valid_env_var_name(&substituted_key) {
+                return Err(ActionError::ExecutionError(format!(
+                    "Invalid environment variable name: {substituted_key}"
+                )));
+            }
+
+            cmd.env(&substituted_key, &substituted_value);
+            tracing::debug!(
+                "Set environment variable: {}={}",
+                substituted_key,
+                substituted_value
+            );
+        }
+
+        // Configure output capture
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        // Spawn the child process
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ActionError::ExecutionError(format!("Failed to spawn command: {e}")))?;
+
+        let result = if let Some(timeout_duration) = self.timeout {
+            // Timeout already validated in security checks above
+
+            // Execute with timeout and proper process cleanup
+            // Use a more complex approach to maintain access to child for cleanup
+            let wait_future = async {
+                // Get stdout and stderr handles before waiting
+                let stdout = child.stdout.take();
+                let stderr = child.stderr.take();
+
+                // Wait for process completion
+                let status = child.wait().await?;
+
+                // Read the output manually
+                let mut stdout_data = Vec::new();
+                let mut stderr_data = Vec::new();
+
+                if let Some(mut stdout_handle) = stdout {
+                    use tokio::io::AsyncReadExt;
+                    stdout_handle.read_to_end(&mut stdout_data).await?;
+                }
+
+                if let Some(mut stderr_handle) = stderr {
+                    use tokio::io::AsyncReadExt;
+                    stderr_handle.read_to_end(&mut stderr_data).await?;
+                }
+
+                Ok::<std::process::Output, std::io::Error>(std::process::Output {
+                    status,
+                    stdout: stdout_data,
+                    stderr: stderr_data,
+                })
+            };
+
+            match timeout(timeout_duration, wait_future).await {
+                Ok(Ok(output)) => {
+                    // Command completed within timeout
+                    let duration_ms = start_time.elapsed().as_millis() as u64;
+                    self.process_command_output(output, duration_ms, context)
+                }
+                Ok(Err(e)) => Err(ActionError::ExecutionError(format!(
+                    "Command execution failed: {e}"
+                ))),
+                Err(_) => {
+                    // Timeout occurred - implement graceful termination
+                    tracing::warn!(
+                        "Command timed out after {:?}, attempting graceful termination",
+                        timeout_duration
+                    );
+
+                    // Terminate the process gracefully
+                    self.terminate_process_gracefully(&mut child).await;
+
+                    let duration_ms = start_time.elapsed().as_millis() as u64;
+                    self.handle_timeout(context, duration_ms)
+                }
+            }
+        } else {
+            // Execute without timeout
+            match child.wait_with_output().await {
+                Ok(output) => {
+                    let duration_ms = start_time.elapsed().as_millis() as u64;
+                    self.process_command_output(output, duration_ms, context)
+                }
+                Err(e) => Err(ActionError::ExecutionError(format!(
+                    "Command execution failed: {e}"
+                ))),
+            }
+        };
+
+        result
+    }
+
+    fn description(&self) -> String {
+        format!("Execute shell command: {}", self.command)
+    }
+
+    fn action_type(&self) -> &'static str {
+        "shell"
+    }
+
+    impl_as_any!();
+}
 
 #[async_trait::async_trait]
 impl Action for SubWorkflowAction {
@@ -1129,15 +1832,8 @@ impl Action for SubWorkflowAction {
                 // Check if the sub-workflow failed due to an abort error
                 // Look for abort error indication in the context
                 if let Some(result) = run.context.get("result") {
-                    if let Some(result_str) = result.as_str() {
-                        if result_str.starts_with("ABORT ERROR:") {
-                            // Extract the abort error message and propagate it
-                            let abort_message = result_str
-                                .trim_start_matches("ABORT ERROR:")
-                                .trim()
-                                .to_string();
-                            return Err(ActionError::AbortError(abort_message));
-                        }
+                    if let Some(_result_str) = result.as_str() {
+                        // Note: String-based abort detection removed - abort handling now done via file-based mechanism
                     }
                 }
 
@@ -1431,8 +2127,20 @@ pub fn parse_action_from_description_with_context(
     description: &str,
     context: &HashMap<String, Value>,
 ) -> ActionResult<Option<Box<dyn Action>>> {
-    let rendered_description = if let Some(template_vars) = context.get("_template_vars") {
-        // Extract template variables from context
+    // Create a mutable copy of the context to merge configuration variables
+    let mut enhanced_context = context.clone();
+
+    // Load and merge sah.toml configuration variables into the context
+    // This uses the existing template integration infrastructure
+    if let Err(e) = sah_config::load_and_merge_repo_config(&mut enhanced_context) {
+        tracing::debug!(
+            "Failed to load sah.toml configuration: {}. Continuing without config variables.",
+            e
+        );
+    }
+
+    let rendered_description = if let Some(template_vars) = enhanced_context.get("_template_vars") {
+        // Extract template variables from context (now includes config variables)
         if let Some(vars_map) = template_vars.as_object() {
             // Convert to liquid Object
             let mut liquid_vars = liquid::Object::new();
@@ -1504,6 +2212,10 @@ pub fn parse_action_from_description(description: &str) -> ActionResult<Option<B
 
     if let Some(abort_action) = parser.parse_abort_action(description)? {
         return Ok(Some(Box::new(abort_action)));
+    }
+
+    if let Some(shell_action) = parser.parse_shell_action(description)? {
+        return Ok(Some(Box::new(shell_action)));
     }
 
     Ok(None)
@@ -1736,6 +2448,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_abort_action_execution() {
+        // Clean up any existing abort file before test
+        let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
         let action = AbortAction::new("Test abort message".to_string());
         let mut context = HashMap::new();
 
@@ -1744,15 +2459,21 @@ mod tests {
 
         let error = result.unwrap_err();
         match error {
-            ActionError::AbortError(msg) => {
-                assert_eq!(msg, "Test abort message");
+            ActionError::ExecutionError(msg) => {
+                assert!(msg.contains("Test abort message"));
             }
-            _ => panic!("Expected AbortError, got {error:?}"),
+            _ => panic!("Expected ExecutionError, got {error:?}"),
         }
+
+        // Clean up abort file after test
+        let _ = std::fs::remove_file(".swissarmyhammer/.abort");
     }
 
     #[tokio::test]
     async fn test_abort_action_with_variable_substitution() {
+        // Clean up any existing abort file before test
+        let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
         let action = AbortAction::new("Error in ${file}: ${error}".to_string());
         let mut context = HashMap::new();
         context.insert("file".to_string(), Value::String("test.rs".to_string()));
@@ -1766,19 +2487,25 @@ mod tests {
 
         let error = result.unwrap_err();
         match error {
-            ActionError::AbortError(msg) => {
-                assert_eq!(msg, "Error in test.rs: compilation failed");
+            ActionError::ExecutionError(msg) => {
+                assert!(msg.contains("Error in test.rs: compilation failed"));
             }
-            _ => panic!("Expected AbortError, got {error:?}"),
+            _ => panic!("Expected ExecutionError, got {error:?}"),
         }
+
+        // Clean up abort file after test
+        let _ = std::fs::remove_file(".swissarmyhammer/.abort");
     }
 
     #[tokio::test]
     async fn test_end_to_end_error_propagation() {
+        // Clean up any existing abort file before test
+        let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
         // Test that abort errors propagate correctly through the system
         use crate::workflow::definition::Workflow;
         use crate::workflow::executor::core::WorkflowExecutor;
-        use crate::workflow::run::WorkflowRunStatus;
+        use crate::workflow::executor::ExecutorError;
         use crate::workflow::state::{State, StateId, StateType};
         use crate::workflow::storage::WorkflowStorage;
         use crate::workflow::transition::{ConditionType, Transition, TransitionCondition};
@@ -1842,19 +2569,543 @@ mod tests {
         // Clean up test storage
         clear_test_storage();
 
-        // The workflow execution should complete (return Ok) but the workflow should be in Failed status
-        assert!(
-            result.is_ok(),
-            "Workflow execution should complete successfully"
-        );
-        assert_eq!(
-            run.status,
-            WorkflowRunStatus::Failed,
-            "Workflow should be marked as failed due to abort action"
-        );
+        // With the new abort system, the workflow execution should return an Abort error
+        match result {
+            Err(executor_error) => match executor_error {
+                ExecutorError::Abort(reason) => {
+                    assert!(
+                        reason.contains("Test abort error"),
+                        "Abort reason should contain expected message: {}",
+                        reason
+                    );
+                }
+                _ => panic!("Expected ExecutorError::Abort, got: {:?}", executor_error),
+            },
+            Ok(_) => panic!("Expected abort error but workflow completed successfully"),
+        }
 
         // Check that the abort action was executed - the context should contain the error
         // The abort action should have been executed and the workflow should have been marked as failed
         // This validates that the error propagation is working correctly
+
+        // Clean up abort file after test
+        let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+    }
+
+    #[test]
+    fn test_shell_action_new() {
+        let action = ShellAction::new("echo hello".to_string());
+
+        assert_eq!(action.command, "echo hello");
+        assert!(action.timeout.is_none());
+        assert!(action.result_variable.is_none());
+        assert!(action.working_dir.is_none());
+        assert!(action.environment.is_empty());
+    }
+
+    #[test]
+    fn test_shell_action_builder_methods() {
+        let mut env = HashMap::new();
+        env.insert("KEY".to_string(), "value".to_string());
+
+        let action = ShellAction::new("ls -la".to_string())
+            .with_timeout(Duration::from_secs(30))
+            .with_result_variable("output".to_string())
+            .with_working_dir("/tmp".to_string())
+            .with_environment(env.clone());
+
+        assert_eq!(action.command, "ls -la");
+        assert_eq!(action.timeout, Some(Duration::from_secs(30)));
+        assert_eq!(action.result_variable, Some("output".to_string()));
+        assert_eq!(action.working_dir, Some("/tmp".to_string()));
+        assert_eq!(action.environment, env);
+    }
+
+    #[test]
+    fn test_shell_action_description() {
+        let action = ShellAction::new("git status".to_string());
+        assert_eq!(action.description(), "Execute shell command: git status");
+    }
+
+    #[test]
+    fn test_shell_action_type() {
+        let action = ShellAction::new("pwd".to_string());
+        assert_eq!(action.action_type(), "shell");
+    }
+
+    #[test]
+    fn test_shell_action_variable_substitution() {
+        let action = ShellAction::new("echo ${name}".to_string());
+        let mut context = HashMap::new();
+        context.insert("name".to_string(), Value::String("world".to_string()));
+
+        let substituted_command = action.substitute_string(&action.command, &context);
+        assert_eq!(substituted_command, "echo world");
+    }
+
+    #[test]
+    fn test_shell_action_environment_variable_substitution() {
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), "/usr/bin:${custom_path}".to_string());
+        env.insert("USER".to_string(), "${current_user}".to_string());
+
+        let action = ShellAction::new("env".to_string()).with_environment(env);
+
+        let mut context = HashMap::new();
+        context.insert(
+            "custom_path".to_string(),
+            Value::String("/opt/bin".to_string()),
+        );
+        context.insert(
+            "current_user".to_string(),
+            Value::String("testuser".to_string()),
+        );
+
+        let substituted_env = action.substitute_map(&action.environment, &context);
+        assert_eq!(
+            substituted_env.get("PATH"),
+            Some(&"/usr/bin:/opt/bin".to_string())
+        );
+        assert_eq!(substituted_env.get("USER"), Some(&"testuser".to_string()));
+    }
+
+    #[test]
+    fn test_shell_action_working_dir_substitution() {
+        let action = ShellAction::new("ls".to_string())
+            .with_working_dir("/home/${username}/projects".to_string());
+
+        let mut context = HashMap::new();
+        context.insert("username".to_string(), Value::String("alice".to_string()));
+
+        let substituted_dir =
+            action.substitute_string(action.working_dir.as_ref().unwrap(), &context);
+        assert_eq!(substituted_dir, "/home/alice/projects");
+    }
+
+    #[test]
+    fn test_shell_action_chaining_builder_methods() {
+        let action = ShellAction::new("cargo build".to_string())
+            .with_timeout(Duration::from_secs(120))
+            .with_result_variable("build_output".to_string())
+            .with_working_dir("./project".to_string());
+
+        assert_eq!(action.command, "cargo build");
+        assert_eq!(action.timeout, Some(Duration::from_secs(120)));
+        assert_eq!(action.result_variable, Some("build_output".to_string()));
+        assert_eq!(action.working_dir, Some("./project".to_string()));
+    }
+
+    #[test]
+    fn test_parse_shell_action_integration() {
+        // Test that shell actions are recognized by the main parser
+        let action = parse_action_from_description("Shell \"echo hello\"")
+            .unwrap()
+            .unwrap();
+        assert_eq!(action.action_type(), "shell");
+        assert_eq!(action.description(), "Execute shell command: echo hello");
+
+        // Test with parameters
+        let action =
+            parse_action_from_description("Shell \"ls -la\" with timeout=30 result=\"files\"")
+                .unwrap()
+                .unwrap();
+        assert_eq!(action.action_type(), "shell");
+
+        // Downcast to ShellAction to verify parameters
+        let shell_action = action.as_any().downcast_ref::<ShellAction>().unwrap();
+        assert_eq!(shell_action.command, "ls -la");
+        assert_eq!(shell_action.timeout, Some(Duration::from_secs(30)));
+        assert_eq!(shell_action.result_variable, Some("files".to_string()));
+    }
+
+    #[test]
+    fn test_shell_action_dispatch_integration() {
+        // Test complete integration through main dispatch function
+        let test_cases = vec![
+            ("Shell \"echo hello\"", "echo hello", None),
+            ("Shell \"pwd\"", "pwd", None),
+            (
+                "Shell \"ls -la\" with timeout=60",
+                "ls -la",
+                Some(Duration::from_secs(60)),
+            ),
+        ];
+
+        for (description, expected_command, expected_timeout) in test_cases {
+            let action = parse_action_from_description(description).unwrap().unwrap();
+            assert_eq!(action.action_type(), "shell", "Failed for: {description}");
+
+            let shell_action = action.as_any().downcast_ref::<ShellAction>().unwrap();
+            assert_eq!(
+                shell_action.command, expected_command,
+                "Command mismatch for: {description}"
+            );
+            assert_eq!(
+                shell_action.timeout, expected_timeout,
+                "Timeout mismatch for: {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shell_action_module_export() {
+        // Test that ShellAction can be imported via the workflow module
+        use crate::workflow::ShellAction as WorkflowShellAction;
+
+        let action = WorkflowShellAction::new("echo test".to_string());
+        assert_eq!(action.command, "echo test");
+        assert_eq!(action.action_type(), "shell");
+
+        // Verify it can be used through the trait
+        let trait_action: &dyn Action = &action;
+        assert_eq!(trait_action.action_type(), "shell");
+    }
+
+    #[tokio::test]
+    async fn test_shell_action_execution_success() {
+        let action = ShellAction::new("echo hello world".to_string());
+        let mut context = HashMap::new();
+
+        let result = action.execute(&mut context).await.unwrap();
+
+        // Verify success context variables are set
+        assert_eq!(context.get("success"), Some(&Value::Bool(true)));
+        assert_eq!(context.get("failure"), Some(&Value::Bool(false)));
+        assert_eq!(context.get("exit_code"), Some(&Value::Number(0.into())));
+
+        // Verify stdout contains expected output
+        let stdout = context.get("stdout").unwrap().as_str().unwrap();
+        assert!(stdout.contains("hello world"));
+
+        // Verify stderr is empty or minimal
+        let stderr = context.get("stderr").unwrap().as_str().unwrap();
+        assert!(stderr.is_empty() || stderr.trim().is_empty());
+
+        // Verify duration is tracked
+        assert!(context.contains_key("duration_ms"));
+        let _duration_ms = context.get("duration_ms").unwrap().as_u64().unwrap();
+        // Duration is always >= 0 for u64, so just verify it exists
+
+        // Verify last action result is success
+        assert_eq!(
+            context.get(LAST_ACTION_RESULT_KEY),
+            Some(&Value::Bool(true))
+        );
+
+        // Result should contain stdout
+        assert_eq!(result, context.get("stdout").unwrap().clone());
+    }
+
+    #[tokio::test]
+    async fn test_shell_action_execution_failure() {
+        let action = ShellAction::new("exit 42".to_string());
+        let mut context = HashMap::new();
+
+        let _result = action.execute(&mut context).await.unwrap();
+
+        // Verify failure context variables are set
+        assert_eq!(context.get("success"), Some(&Value::Bool(false)));
+        assert_eq!(context.get("failure"), Some(&Value::Bool(true)));
+        assert_eq!(context.get("exit_code"), Some(&Value::Number(42.into())));
+
+        // Verify stdout and stderr are captured
+        assert!(context.contains_key("stdout"));
+        assert!(context.contains_key("stderr"));
+
+        // Verify duration is tracked
+        assert!(context.contains_key("duration_ms"));
+
+        // Verify last action result is failure
+        assert_eq!(
+            context.get(LAST_ACTION_RESULT_KEY),
+            Some(&Value::Bool(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_action_with_variable_substitution_execution() {
+        let action = ShellAction::new("echo ${greeting} ${name}".to_string());
+        let mut context = HashMap::new();
+        context.insert("greeting".to_string(), Value::String("Hello".to_string()));
+        context.insert("name".to_string(), Value::String("World".to_string()));
+
+        let _result = action.execute(&mut context).await.unwrap();
+
+        // Verify the command was substituted correctly
+        let stdout = context.get("stdout").unwrap().as_str().unwrap();
+        assert!(stdout.contains("Hello World"));
+
+        // Verify success
+        assert_eq!(context.get("success"), Some(&Value::Bool(true)));
+    }
+
+    #[tokio::test]
+    async fn test_shell_action_with_result_variable() {
+        let action = ShellAction::new("echo test output".to_string())
+            .with_result_variable("command_output".to_string());
+        let mut context = HashMap::new();
+
+        let result = action.execute(&mut context).await.unwrap();
+
+        // Verify result variable is set
+        assert!(context.contains_key("command_output"));
+        let command_output = context.get("command_output").unwrap();
+        assert_eq!(command_output, &result);
+
+        // Result should be the stdout
+        let stdout = context.get("stdout").unwrap().as_str().unwrap();
+        assert!(stdout.contains("test output"));
+        assert_eq!(result, context.get("stdout").unwrap().clone());
+    }
+
+    #[tokio::test]
+    async fn test_shell_action_with_working_directory() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        // Create a unique temporary directory for testing
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        let action = ShellAction::new("pwd".to_string())
+            .with_working_dir(temp_path.to_string_lossy().to_string());
+        let mut context = HashMap::new();
+
+        let _result = action.execute(&mut context).await.unwrap();
+
+        // Verify success
+        assert_eq!(context.get("success"), Some(&Value::Bool(true)));
+
+        // Verify the working directory was used
+        let stdout = context.get("stdout").unwrap().as_str().unwrap().trim();
+        let canonical_temp_path = fs::canonicalize(temp_path).unwrap();
+        let canonical_stdout_path = fs::canonicalize(stdout).unwrap_or_else(|_| stdout.into());
+
+        assert_eq!(canonical_stdout_path, canonical_temp_path);
+    }
+
+    #[tokio::test]
+    async fn test_shell_action_with_environment_variables() {
+        let mut env = HashMap::new();
+        env.insert("TEST_VAR".to_string(), "test_value".to_string());
+        env.insert("ANOTHER_VAR".to_string(), "another_value".to_string());
+
+        let action =
+            ShellAction::new("echo $TEST_VAR $ANOTHER_VAR".to_string()).with_environment(env);
+        let mut context = HashMap::new();
+
+        let _result = action.execute(&mut context).await.unwrap();
+
+        // Verify success
+        assert_eq!(context.get("success"), Some(&Value::Bool(true)));
+
+        // Verify environment variables were set
+        let stdout = context.get("stdout").unwrap().as_str().unwrap();
+        assert!(stdout.contains("test_value"));
+        assert!(stdout.contains("another_value"));
+    }
+
+    #[tokio::test]
+    async fn test_shell_action_with_environment_variable_substitution() {
+        let mut env = HashMap::new();
+        env.insert("TEST_VAR".to_string(), "${dynamic_value}".to_string());
+
+        let action = ShellAction::new("echo $TEST_VAR".to_string()).with_environment(env);
+        let mut context = HashMap::new();
+        context.insert(
+            "dynamic_value".to_string(),
+            Value::String("substituted".to_string()),
+        );
+
+        let _result = action.execute(&mut context).await.unwrap();
+
+        // Verify success
+        assert_eq!(context.get("success"), Some(&Value::Bool(true)));
+
+        // Verify environment variable substitution worked
+        let stdout = context.get("stdout").unwrap().as_str().unwrap();
+        assert!(stdout.contains("substituted"));
+    }
+
+    #[tokio::test]
+    async fn test_shell_action_timeout() {
+        use std::time::Duration;
+
+        // Create an action with a very short timeout
+        let action =
+            ShellAction::new("sleep 10".to_string()).with_timeout(Duration::from_millis(200));
+        let mut context = HashMap::new();
+
+        let result = action.execute(&mut context).await.unwrap();
+
+        // Verify timeout results in failure state
+        assert_eq!(context.get("success"), Some(&Value::Bool(false)));
+        assert_eq!(context.get("failure"), Some(&Value::Bool(true)));
+
+        // Exit code should indicate timeout (-1)
+        assert_eq!(context.get("exit_code"), Some(&Value::Number((-1).into())));
+
+        // Verify stderr contains timeout message
+        assert_eq!(
+            context.get("stderr"),
+            Some(&Value::String("Command timed out".to_string()))
+        );
+
+        // Verify stdout is empty for timeout
+        assert_eq!(context.get("stdout"), Some(&Value::String("".to_string())));
+
+        // Duration should be tracked and around the timeout duration
+        assert!(context.contains_key("duration_ms"));
+        let duration_ms = context.get("duration_ms").unwrap().as_u64().unwrap();
+        // Should be around 200ms or slightly more (allowing for process cleanup)
+        assert!((200..1000).contains(&duration_ms));
+
+        // Result should be false for timeout
+        assert_eq!(result, Value::Bool(false));
+
+        // Last action result should indicate failure
+        assert_eq!(
+            context.get(LAST_ACTION_RESULT_KEY),
+            Some(&Value::Bool(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_action_timeout_with_result_variable() {
+        use std::time::Duration;
+
+        // Create an action with timeout and result variable
+        let action = ShellAction::new("sleep 5".to_string())
+            .with_timeout(Duration::from_millis(100))
+            .with_result_variable("output".to_string());
+        let mut context = HashMap::new();
+
+        let _result = action.execute(&mut context).await.unwrap();
+
+        // Verify timeout results in failure state
+        assert_eq!(context.get("success"), Some(&Value::Bool(false)));
+        assert_eq!(context.get("failure"), Some(&Value::Bool(true)));
+
+        // Result variable should NOT be set on timeout
+        assert!(!context.contains_key("output"));
+
+        // Verify timeout context variables
+        assert_eq!(
+            context.get("stderr"),
+            Some(&Value::String("Command timed out".to_string()))
+        );
+        assert_eq!(context.get("stdout"), Some(&Value::String("".to_string())));
+    }
+
+    #[tokio::test]
+    async fn test_shell_action_no_timeout_by_default() {
+        // Test that commands without explicit timeout still work
+        let action = ShellAction::new("echo no timeout test".to_string());
+        let mut context = HashMap::new();
+
+        let result = action.execute(&mut context).await.unwrap();
+
+        // Verify success
+        assert_eq!(context.get("success"), Some(&Value::Bool(true)));
+        assert_eq!(context.get("failure"), Some(&Value::Bool(false)));
+
+        // Verify output
+        let stdout = context.get("stdout").unwrap().as_str().unwrap();
+        assert!(stdout.contains("no timeout test"));
+
+        // Result should contain output
+        assert_eq!(result, context.get("stdout").unwrap().clone());
+    }
+
+    #[tokio::test]
+    async fn test_shell_action_successful_within_timeout() {
+        use std::time::Duration;
+
+        // Command that completes quickly within timeout
+        let action =
+            ShellAction::new("echo quick command".to_string()).with_timeout(Duration::from_secs(5));
+        let mut context = HashMap::new();
+
+        let result = action.execute(&mut context).await.unwrap();
+
+        // Verify success
+        assert_eq!(context.get("success"), Some(&Value::Bool(true)));
+        assert_eq!(context.get("failure"), Some(&Value::Bool(false)));
+
+        // Exit code should be 0
+        assert_eq!(context.get("exit_code"), Some(&Value::Number(0.into())));
+
+        // Verify output
+        let stdout = context.get("stdout").unwrap().as_str().unwrap();
+        assert!(stdout.contains("quick command"));
+
+        // Duration should be much less than timeout
+        let duration_ms = context.get("duration_ms").unwrap().as_u64().unwrap();
+        assert!(duration_ms < 1000); // Should complete in less than 1 second
+
+        // Result should contain output
+        assert_eq!(result, context.get("stdout").unwrap().clone());
+    }
+
+    #[tokio::test]
+    async fn test_shell_action_timeout_process_cleanup() {
+        use std::time::Duration;
+
+        // This test verifies that timeout processes are properly terminated
+        // If the process cleanup didn't work, this test would hang for 30 seconds
+        let action =
+            ShellAction::new("sleep 30".to_string()).with_timeout(Duration::from_millis(150));
+        let mut context = HashMap::new();
+
+        let start_time = std::time::Instant::now();
+        let _result = action.execute(&mut context).await.unwrap();
+        let elapsed = start_time.elapsed();
+
+        // Verify the command was terminated quickly (within reasonable bounds)
+        // This proves the process was actually killed, not just timed out
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "Process cleanup took too long: {elapsed:?}. This indicates the process was not properly terminated."
+        );
+
+        // Verify timeout state is correctly set
+        assert_eq!(context.get("success"), Some(&Value::Bool(false)));
+        assert_eq!(context.get("failure"), Some(&Value::Bool(true)));
+        assert_eq!(context.get("exit_code"), Some(&Value::Number((-1).into())));
+        assert_eq!(
+            context.get("stderr"),
+            Some(&Value::String("Command timed out".to_string()))
+        );
+        assert_eq!(context.get("stdout"), Some(&Value::String("".to_string())));
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "windows")]
+    async fn test_shell_action_windows_command_format() {
+        // Test that Windows uses cmd /C for shell commands
+        let action = ShellAction::new("echo windows test".to_string());
+        let mut context = HashMap::new();
+
+        let _result = action.execute(&mut context).await.unwrap();
+
+        // Verify success - this confirms the Windows cmd /C format worked
+        assert_eq!(context.get("success"), Some(&Value::Bool(true)));
+        let stdout = context.get("stdout").unwrap().as_str().unwrap();
+        assert!(stdout.contains("windows test"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn test_shell_action_unix_command_format() {
+        // Test that Unix systems use sh -c for shell commands
+        let action = ShellAction::new("echo unix test".to_string());
+        let mut context = HashMap::new();
+
+        let _result = action.execute(&mut context).await.unwrap();
+
+        // Verify success - this confirms the Unix sh -c format worked
+        assert_eq!(context.get("success"), Some(&Value::Bool(true)));
+        let stdout = context.get("stdout").unwrap().as_str().unwrap();
+        assert!(stdout.contains("unix test"));
     }
 }

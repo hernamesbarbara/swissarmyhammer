@@ -5,12 +5,6 @@ tags:
   - auto
 ---
 
-## Usage
-
-```bash
-swissarmyhammer flow run tdd
-```
-
 ## States
 
 ```mermaid
@@ -19,7 +13,8 @@ stateDiagram-v2
     start --> are_tests_passing
     are_tests_passing --> loop
     loop --> done: result.contains("YES")
-    loop --> test: result.contains("NO")
+    loop --> test: result.contains("NO") 
+    loop --> test: default
     test --> are_tests_passing
     done --> [*]
 ```

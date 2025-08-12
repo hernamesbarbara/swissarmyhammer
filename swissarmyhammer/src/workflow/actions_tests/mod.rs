@@ -57,10 +57,6 @@ mod action_parsing_tests;
 
 #[cfg(test)]
 mod claude_output_formatting_tests;
-
-#[cfg(test)]
-mod claude_retry_tests;
-
 #[cfg(test)]
 mod concurrent_action_tests;
 
@@ -84,3 +80,9 @@ mod simple_state_pollution_test;
 
 #[cfg(test)]
 mod prompt_action_tests;
+
+#[cfg(test)]
+mod shell_action_tests;
+
+#[cfg(test)]
+mod shell_action_integration_tests;

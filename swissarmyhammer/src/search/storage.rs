@@ -16,6 +16,7 @@ use duckdb::{Connection, ToSql};
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tracing;
 
 /// Vector storage for code chunks and embeddings using DuckDB
 ///
@@ -1170,6 +1171,46 @@ impl VectorStorage {
             _ => crate::search::types::ChunkType::PlainText,
         }
     }
+
+    /// Explicitly close the database connection
+    ///
+    /// This method allows for explicit cleanup of DuckDB connections,
+    /// which can help prevent assertion failures during Drop.
+    pub fn close(&self) -> Result<()> {
+        if let Ok(conn) = self.connection.lock() {
+            // Test connection validity before attempting to close
+            match conn.execute("SELECT 1", []) {
+                Ok(_) => {
+                    // Connection is valid, perform explicit close
+                    drop(conn);
+                    tracing::debug!("Successfully closed VectorStorage database connection");
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::warn!("Connection test failed during close: {}", e);
+                    // Connection was already invalid, just drop it
+                    drop(conn);
+                    Ok(())
+                }
+            }
+        } else {
+            tracing::warn!("Could not acquire connection lock during close");
+            Ok(())
+        }
+    }
+}
+
+/// Enhanced Drop implementation for VectorStorage
+///
+/// This implementation ensures proper cleanup of DuckDB connections
+/// by validating the connection before attempting to drop it.
+impl Drop for VectorStorage {
+    fn drop(&mut self) {
+        // Attempt graceful cleanup with connection validation
+        if let Err(e) = self.close() {
+            tracing::warn!("Error during VectorStorage drop cleanup: {}", e);
+        }
+    }
 }
 
 /// Statistics about the vector storage
@@ -1440,11 +1481,11 @@ mod tests {
 
         match result {
             Ok(results) => {
-                println!("Search succeeded with {} results", results.len());
+                tracing::debug!("Search succeeded with {} results", results.len());
                 assert_eq!(results.len(), 0); // Should be empty but not fail
             }
             Err(e) => {
-                println!("Search failed with error: {e}");
+                tracing::error!("Search failed with error: {e}");
                 panic!("similarity_search should not fail on empty database: {e}");
             }
         }
@@ -1452,20 +1493,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_reproduce_full_search_integration() {
-        use crate::search::{EmbeddingEngine, SearchQuery, SemanticConfig, SemanticSearcher};
+        use crate::search::{EmbeddingEngine, SearchQuery, SemanticSearcher};
         use std::error::Error;
-        use std::time::{SystemTime, UNIX_EPOCH};
 
-        // Use test config to avoid trying to download real embedding models
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let db_path = format!("/tmp/test_semantic_integration_{timestamp}.db");
-        let config = SemanticConfig {
-            database_path: std::path::PathBuf::from(db_path),
-            ..SemanticConfig::default()
-        };
+        // Use proper test config for unique temp directories and avoid trying to download real embedding models
+        let (config, _guard) = create_test_config();
 
         let storage = VectorStorage::new(config.clone()).unwrap();
         storage.initialize().unwrap();
@@ -1486,7 +1518,7 @@ mod tests {
 
                 match searcher.search(&search_query).await {
                     Ok(results) => {
-                        println!(
+                        tracing::debug!(
                             "Full integration search succeeded! Found {} results",
                             results.len()
                         );
@@ -1495,15 +1527,15 @@ mod tests {
                         // Test that we get results back (could be 0 or more)
                     }
                     Err(e) => {
-                        println!("Full integration search failed with error: {e}");
-                        println!("Error debug: {e:?}");
+                        tracing::error!("Full integration search failed with error: {e}");
+                        tracing::error!("Error debug: {e:?}");
 
-                        // Print the full error chain
+                        // Log the full error chain
                         let mut source = e.source();
                         let mut level = 1;
                         while let Some(err) = source {
-                            println!("  Error level {level}: {err}");
-                            println!("  Error level {level} debug: {err:?}");
+                            tracing::error!("  Error level {level}: {err}");
+                            tracing::error!("  Error level {level} debug: {err:?}");
                             source = err.source();
                             level += 1;
                         }
@@ -1513,7 +1545,7 @@ mod tests {
                 }
             }
             Err(e) => {
-                println!("Failed to create searcher: {e}");
+                tracing::error!("Failed to create searcher: {e}");
                 panic!("Failed to create searcher: {e}");
             }
         }

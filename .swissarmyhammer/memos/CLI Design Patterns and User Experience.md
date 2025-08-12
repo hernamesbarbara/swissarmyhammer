@@ -123,24 +123,73 @@ let log_level = match (cli.quiet, cli.debug, cli.verbose) {
 - Configurable log files via environment variables
 - Enhanced debugging for protocol communication
 
+## MCP Tool Integration Pattern
+
+**CliToolContext Initialization**
+```rust
+// Common pattern across all MCP-integrated commands
+let context = CliToolContext::new().await?;
+```
+
+**Structured Argument Creation**
+```rust
+// Pattern for tool arguments with type safety
+let args = context.create_arguments(vec![
+    ("name", json!(name)),
+    ("content", json!(content)),
+    ("append", json!(append)),
+]);
+```
+
+**Consistent Tool Execution**
+```rust
+// Standard execution and response handling
+let result = context.execute_tool("issue_create", args).await?;
+println!("{}", response_formatting::format_success_response(&result));
+```
+
+**Key MCP Integration Patterns:**
+- Single `CliToolContext` per command execution
+- Type-safe argument construction with `serde_json::json!` macro
+- Consistent error propagation with `?` operator
+- Uniform response formatting for all tool outputs
+- Empty argument vectors for parameterless tools
+
 ## Command Delegation Pattern
 
 **Clean Separation of Concerns**
 ```rust
-// Main dispatcher
+// Main dispatcher with MCP tool delegation
 match cli.command {
     Some(Commands::Prompt { subcommand }) => run_prompt(subcommand).await,
     Some(Commands::Issue { subcommand }) => run_issue(subcommand).await,
     Some(Commands::Memo { subcommand }) => run_memo(subcommand).await,
-    // ... each command delegates to specialized handler
+    // ... each command delegates to MCP tool handlers
+}
+```
+
+**MCP-Aware Command Handlers**
+```rust
+pub async fn handle_issue_command(
+    command: IssueCommands,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let context = CliToolContext::new().await?;
+    
+    match command {
+        IssueCommands::Create { name, content, file } => {
+            create_issue(&context, name, content, file).await?;
+        }
+        // ... pattern continues for all subcommands
+    }
+    Ok(())
 }
 ```
 
 **Async Command Handling**
-- Tokio runtime for async operations
-- Graceful shutdown handling
-- Resource cleanup on termination
-- Signal handling for interruption
+- Tokio runtime for async MCP tool operations
+- Context initialization before tool execution
+- Graceful error handling through tool context
+- Resource cleanup managed by context lifetime
 
 ## Shell Integration Features
 

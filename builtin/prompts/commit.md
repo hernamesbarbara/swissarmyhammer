@@ -10,12 +10,9 @@ The goal is to commit your code to git on the current branch.
 ## Guidelines
 
 - You MUST NOT commit scratch files that you generated, only commit source that you want in the project permanently
-- You MUST NOT commit on the `main` branch
 - You MUST NOT miss files on the commit
   - You MUST commit all the source files modified on the current branch
   - You MUST check for and create if needed a sensible project specific .gitignore
-- If you are on the `main` branch, you must create a work branch named `work/<sensible_readable_name>` before you commit
-- If you create a branch, let the user know
 
 ## Process
 

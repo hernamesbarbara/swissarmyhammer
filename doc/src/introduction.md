@@ -32,8 +32,6 @@ SwissArmyHammer transforms prompt chaos into organized, collaborative workflow w
 
 **⚡ Developer-First Tooling**: Rich CLI with instant search, validation, testing, and diagnostics ensures your prompts are always discoverable, reliable, and maintainable.
 
-**The Result**: Teams report 5x faster prompt iteration, zero lost prompts, and dramatically improved prompt quality through systematic organization and collaboration.
-
 ## How SwissArmyHammer Works
 
 SwissArmyHammer transforms your prompt workflow through:
@@ -155,9 +153,6 @@ SwissArmyHammer follows a simple but powerful architecture:
 ## Next Steps
 
 1. **[Install SwissArmyHammer](./installation.md)** - Get up and running quickly
-2. **[Create Your First Prompt](./first-prompt.md)** - Learn the basics
-3. **[Integrate with Claude Code](./claude-code-integration.md)** - Connect to your AI assistant
-4. **[Explore Advanced Features](./advanced-prompts.md)** - Unlock the full potential
 
 ## Why Choose SwissArmyHammer?
 
@@ -172,10 +167,8 @@ SwissArmyHammer follows a simple but powerful architecture:
 ## Join the Community
 
 - **[GitHub Repository](https://github.com/wballard/swissarmyhammer)** - Source code, issues, and discussions
-- **[Contributing Guide](./contributing.md)** - How to contribute to the project
 - **[Issue Tracker](https://github.com/wballard/swissarmyhammer/issues)** - Report bugs and request features
-- **[Discussions](https://github.com/wballard/swissarmyhammer/discussions)** - Community Q&A and sharing
 
 ## License
 
-SwissArmyHammer is open source software licensed under the MIT License. See the [License](./license.md) page for details.
+SwissArmyHammer is open source software licensed under the MIT License.

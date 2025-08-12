@@ -5,19 +5,12 @@ tags:
   - auto
 ---
 
-## Usage
-
-```bash
-swissarmyhammer flow run do_issue
-```
-
 ## States
 
 ```mermaid
 stateDiagram-v2
     [*] --> start
-    start --> branch
-    branch --> code
+    start --> code
     code --> review
     review --> complete
     complete --> merge
@@ -27,11 +20,10 @@ stateDiagram-v2
 ## Actions
 
 - start: log "Working an issue"
-- branch: execute prompt "issue/branch"
 - code: run workflow "code_issue"
 - review: run workflow "review_issue"
-- complete: execute prompt "issue/complete"
-- merge: execute prompt "merge"
+- complete: run workflow "complete_issue"
+- merge: execute prompt "issue/merge"
 
 ## Description
 

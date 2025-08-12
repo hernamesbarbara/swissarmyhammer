@@ -1538,3 +1538,377 @@ async fn test_say_hello_workflow() {
         .details
         .contains("Hello from Swiss Army Hammer! The workflow system is working correctly.")));
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_abort_file_detection() {
+    let mut executor = WorkflowExecutor::new();
+
+    // Create a workflow with multiple states that would normally complete
+    let mut workflow = Workflow::new(
+        WorkflowName::new("Abort Test"),
+        "Test workflow abort detection".to_string(),
+        StateId::new("start"),
+    );
+
+    workflow.add_state(create_state("start", "Start state", false));
+    workflow.add_state(create_state("step1", "Step 1 state", false));
+    workflow.add_state(create_state("step2", "Step 2 state", false));
+    workflow.add_state(create_state("step3", "Step 3 state", false));
+    workflow.add_state(create_state("end", "End state", true));
+
+    workflow.add_transition(create_transition("start", "step1", ConditionType::Always));
+    workflow.add_transition(create_transition("step1", "step2", ConditionType::Always));
+    workflow.add_transition(create_transition("step2", "step3", ConditionType::Always));
+    workflow.add_transition(create_transition("step3", "end", ConditionType::Always));
+
+    // Clean up any existing abort file first
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    // Start the workflow run manually to get past the cleanup
+    let mut run = executor.start_workflow(workflow).unwrap();
+
+    // Now create the abort file AFTER the cleanup has happened
+    std::fs::create_dir_all(".swissarmyhammer").unwrap();
+    std::fs::write(".swissarmyhammer/.abort", "Test abort reason").unwrap();
+
+    // Now execute with the abort file present
+    let result = executor
+        .execute_state_with_limit(&mut run, 1000)
+        .await
+        .map(|_| run);
+
+    // Clean up the abort file
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    // Should return an abort error
+    assert!(matches!(result, Err(ExecutorError::Abort(_))));
+
+    if let Err(ExecutorError::Abort(reason)) = result {
+        assert_eq!(reason, "Test abort reason");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_abort_file_detection_with_read_error() {
+    let mut executor = WorkflowExecutor::new();
+
+    // Create a simple workflow
+    let mut workflow = Workflow::new(
+        WorkflowName::new("Abort Read Error Test"),
+        "Test workflow abort with read error".to_string(),
+        StateId::new("start"),
+    );
+
+    workflow.add_state(create_state("start", "Start state", false));
+    workflow.add_state(create_state("end", "End state", true));
+
+    workflow.add_transition(create_transition("start", "end", ConditionType::Always));
+
+    // Clean up any existing abort file first
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    // Start the workflow run manually to get past the cleanup
+    let mut run = executor.start_workflow(workflow).unwrap();
+
+    // Create abort file but make it unreadable (simulate read error)
+    std::fs::create_dir_all(".swissarmyhammer").unwrap();
+    std::fs::write(".swissarmyhammer/.abort", "").unwrap();
+
+    let result = executor
+        .execute_state_with_limit(&mut run, 1000)
+        .await
+        .map(|_| run);
+
+    // Clean up
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    // Should return abort error with fallback message when file exists but is empty/unreadable
+    assert!(matches!(result, Err(ExecutorError::Abort(_))));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_abort_file_detection_during_multiple_state_transitions() {
+    let mut executor = WorkflowExecutor::new();
+
+    // Create a multi-state workflow
+    let mut workflow = Workflow::new(
+        WorkflowName::new("Multi State Abort Test"),
+        "Test abort during multiple transitions".to_string(),
+        StateId::new("start"),
+    );
+
+    workflow.add_state(create_state("start", "Start state", false));
+    workflow.add_state(create_state("step1", "Step 1", false));
+    workflow.add_state(create_state("step2", "Step 2", false));
+    workflow.add_state(create_state("step3", "Step 3", false));
+    workflow.add_state(create_state("end", "End state", true));
+
+    workflow.add_transition(create_transition("start", "step1", ConditionType::Always));
+    workflow.add_transition(create_transition("step1", "step2", ConditionType::Always));
+    workflow.add_transition(create_transition("step2", "step3", ConditionType::Always));
+    workflow.add_transition(create_transition("step3", "end", ConditionType::Always));
+
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    let mut run = executor.start_workflow(workflow).unwrap();
+
+    // Let it execute one transition first
+    let result = executor.execute_state_with_limit(&mut run, 1).await;
+
+    // The first execution might fail due to MCP issues, so let's be flexible
+    if result.is_err() {
+        // If it fails, it might be due to missing MCP server
+        println!("First transition failed (likely MCP): {:?}", result);
+    }
+
+    // Now create abort file in the middle of execution
+    std::fs::create_dir_all(".swissarmyhammer").unwrap();
+    std::fs::write(".swissarmyhammer/.abort", "Mid-execution abort").unwrap();
+
+    // Continue execution - should detect abort
+    let result = executor
+        .execute_state_with_limit(&mut run, 1000)
+        .await
+        .map(|_| run);
+
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    assert!(matches!(result, Err(ExecutorError::Abort(_))));
+    if let Err(ExecutorError::Abort(reason)) = result {
+        assert_eq!(reason, "Mid-execution abort");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_abort_file_detection_with_unicode_reason() {
+    let mut executor = WorkflowExecutor::new();
+
+    let mut workflow = Workflow::new(
+        WorkflowName::new("Unicode Abort Test"),
+        "Test abort with unicode content".to_string(),
+        StateId::new("start"),
+    );
+
+    workflow.add_state(create_state("start", "Start state", false));
+    workflow.add_state(create_state("end", "End state", true));
+    workflow.add_transition(create_transition("start", "end", ConditionType::Always));
+
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    let mut run = executor.start_workflow(workflow).unwrap();
+
+    let unicode_reason = "中文测试 🚫 Abort with émojis and ñoñ-ASCII";
+    std::fs::create_dir_all(".swissarmyhammer").unwrap();
+    std::fs::write(".swissarmyhammer/.abort", unicode_reason).unwrap();
+
+    let result = executor
+        .execute_state_with_limit(&mut run, 1000)
+        .await
+        .map(|_| run);
+
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    assert!(matches!(result, Err(ExecutorError::Abort(_))));
+    if let Err(ExecutorError::Abort(reason)) = result {
+        assert_eq!(reason, unicode_reason);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_abort_file_detection_with_large_reason() {
+    let mut executor = WorkflowExecutor::new();
+
+    let mut workflow = Workflow::new(
+        WorkflowName::new("Large Reason Abort Test"),
+        "Test abort with large content".to_string(),
+        StateId::new("start"),
+    );
+
+    workflow.add_state(create_state("start", "Start state", false));
+    workflow.add_state(create_state("end", "End state", true));
+    workflow.add_transition(create_transition("start", "end", ConditionType::Always));
+
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    let mut run = executor.start_workflow(workflow).unwrap();
+
+    let large_reason = "x".repeat(5000);
+    std::fs::create_dir_all(".swissarmyhammer").unwrap();
+    std::fs::write(".swissarmyhammer/.abort", &large_reason).unwrap();
+
+    let result = executor
+        .execute_state_with_limit(&mut run, 1000)
+        .await
+        .map(|_| run);
+
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    assert!(matches!(result, Err(ExecutorError::Abort(_))));
+    if let Err(ExecutorError::Abort(reason)) = result {
+        assert_eq!(reason, large_reason);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_abort_file_detection_with_newlines() {
+    let mut executor = WorkflowExecutor::new();
+
+    let mut workflow = Workflow::new(
+        WorkflowName::new("Newline Abort Test"),
+        "Test abort with newlines".to_string(),
+        StateId::new("start"),
+    );
+
+    workflow.add_state(create_state("start", "Start state", false));
+    workflow.add_state(create_state("end", "End state", true));
+    workflow.add_transition(create_transition("start", "end", ConditionType::Always));
+
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    let mut run = executor.start_workflow(workflow).unwrap();
+
+    let reason_with_newlines = "Line 1\nLine 2\r\nLine 3\n";
+    std::fs::create_dir_all(".swissarmyhammer").unwrap();
+    std::fs::write(".swissarmyhammer/.abort", reason_with_newlines).unwrap();
+
+    let result = executor
+        .execute_state_with_limit(&mut run, 1000)
+        .await
+        .map(|_| run);
+
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    assert!(matches!(result, Err(ExecutorError::Abort(_))));
+    if let Err(ExecutorError::Abort(reason)) = result {
+        assert_eq!(reason, reason_with_newlines);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_abort_file_performance_impact() {
+    use std::time::Instant;
+
+    let mut executor = WorkflowExecutor::new();
+
+    // Create a simple fast workflow
+    let mut workflow = Workflow::new(
+        WorkflowName::new("Performance Test"),
+        "Test abort performance impact".to_string(),
+        StateId::new("start"),
+    );
+
+    workflow.add_state(create_state("start", "Start state", false));
+    workflow.add_state(create_state("end", "End state", true));
+    workflow.add_transition(create_transition("start", "end", ConditionType::Always));
+
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    // Time execution without abort file
+    let start_without_abort = Instant::now();
+    for _ in 0..100 {
+        let mut run = executor.start_workflow(workflow.clone()).unwrap();
+        let _ = executor.execute_state_with_limit(&mut run, 1000).await;
+    }
+    let duration_without_abort = start_without_abort.elapsed();
+
+    // Create abort file
+    std::fs::create_dir_all(".swissarmyhammer").unwrap();
+    std::fs::write(".swissarmyhammer/.abort", "Performance test abort").unwrap();
+
+    // Time execution with abort file (will fail but we measure time to first check)
+    let start_with_abort = Instant::now();
+    for _ in 0..10 {
+        // Recreate the abort file each time since it gets detected and errors
+        std::fs::write(".swissarmyhammer/.abort", "Performance test abort").unwrap();
+        let mut run = executor.start_workflow(workflow.clone()).unwrap();
+        let _ = executor.execute_state_with_limit(&mut run, 1000).await;
+    }
+    let duration_with_abort = start_with_abort.elapsed();
+
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    // Abort checking should not significantly impact performance
+    // Allow up to 10x overhead (very generous, should be much less)
+    let max_acceptable_overhead = duration_without_abort * 10;
+    assert!(
+        duration_with_abort < max_acceptable_overhead,
+        "Abort checking overhead too high: {:?} vs {:?}",
+        duration_with_abort,
+        duration_without_abort
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_abort_file_detection_zero_transitions_limit() {
+    let mut executor = WorkflowExecutor::new();
+
+    let mut workflow = Workflow::new(
+        WorkflowName::new("Zero Limit Test"),
+        "Test abort with zero transition limit".to_string(),
+        StateId::new("start"),
+    );
+
+    workflow.add_state(create_state("start", "Start state", false));
+    workflow.add_state(create_state("end", "End state", true));
+    workflow.add_transition(create_transition("start", "end", ConditionType::Always));
+
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    let mut run = executor.start_workflow(workflow).unwrap();
+
+    std::fs::create_dir_all(".swissarmyhammer").unwrap();
+    std::fs::write(".swissarmyhammer/.abort", "Zero limit abort").unwrap();
+
+    // Execute with 1 transition limit - should check for abort before transitions
+    let result = executor
+        .execute_state_with_limit(&mut run, 1)
+        .await
+        .map(|_| run);
+
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    // Should detect abort before hitting limit
+    assert!(matches!(result, Err(ExecutorError::Abort(_))));
+    if let Err(ExecutorError::Abort(reason)) = result {
+        assert_eq!(reason, "Zero limit abort");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_abort_file_not_present_normal_execution() {
+    let mut executor = WorkflowExecutor::new();
+
+    let mut workflow = Workflow::new(
+        WorkflowName::new("Normal Execution Test"),
+        "Test normal execution without abort file".to_string(),
+        StateId::new("start"),
+    );
+
+    workflow.add_state(create_state("start", "Start state", false));
+    workflow.add_state(create_state("step1", "Step 1", false));
+    workflow.add_state(create_state("end", "End state", true));
+
+    workflow.add_transition(create_transition("start", "step1", ConditionType::Always));
+    workflow.add_transition(create_transition("step1", "end", ConditionType::Always));
+
+    let _ = std::fs::remove_file(".swissarmyhammer/.abort");
+
+    let mut run = executor.start_workflow(workflow).unwrap();
+
+    // Execute normally without abort file
+    let result = executor.execute_state_with_limit(&mut run, 1000).await;
+
+    // Should complete successfully
+    assert!(result.is_ok());
+    assert_eq!(run.current_state.as_str(), "end");
+    assert_eq!(run.status, WorkflowRunStatus::Completed);
+}

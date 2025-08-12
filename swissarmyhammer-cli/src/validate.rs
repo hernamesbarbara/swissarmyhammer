@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use colored::*;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use swissarmyhammer::sah_config::validate_config_file;
 use swissarmyhammer::validation::{
-    Validatable, ValidationConfig, ValidationIssue, ValidationLevel, ValidationResult,
+    Validatable, ValidationConfig, ValidationIssue, ValidationLevel, ValidationManager,
+    ValidationResult,
 };
 use swissarmyhammer::workflow::{
     MemoryWorkflowStorage, MermaidParser, Workflow, WorkflowResolver, WorkflowStorageBackend,
@@ -32,15 +34,18 @@ struct JsonValidationIssue {
 
 pub struct Validator {
     quiet: bool,
-    #[allow(dead_code)] // TODO: Use config to control validation behavior
     config: ValidationConfig,
+    validation_manager: ValidationManager,
 }
 
 impl Validator {
     pub fn new(quiet: bool) -> Self {
+        let config = ValidationConfig::default();
+        let validation_manager = ValidationManager::new(config.clone());
         Self {
             quiet,
-            config: ValidationConfig::default(),
+            config,
+            validation_manager,
         }
     }
 
@@ -83,6 +88,9 @@ impl Validator {
 
         // Validate workflows using WorkflowResolver for consistent loading
         self.validate_all_workflows(&mut result)?;
+
+        // Validate sah.toml configuration file
+        self.validate_sah_config(&mut result)?;
 
         Ok(result)
     }
@@ -130,6 +138,9 @@ impl Validator {
         // Validate workflows from custom directories
         self.validate_workflows_from_dirs(&mut result, workflow_dirs)?;
 
+        // Validate sah.toml configuration file
+        self.validate_sah_config(&mut result)?;
+
         Ok(result)
     }
 
@@ -176,8 +187,7 @@ impl Validator {
 
             // Create a path that includes the source location for better debugging
             let workflow_path = PathBuf::from(format!(
-                "workflow:{}:{}",
-                source_location,
+                "workflow:{source_location}:{}",
                 workflow.name.as_str()
             ));
 
@@ -198,6 +208,25 @@ impl Validator {
         workflow_path: &Path,
         result: &mut ValidationResult,
     ) {
+        // Check workflow complexity using config
+        let complexity = workflow.states.len() + workflow.transitions.len();
+        if complexity > self.config.max_workflow_complexity {
+            result.add_issue(ValidationIssue {
+                level: ValidationLevel::Warning,
+                file_path: workflow_path.to_path_buf(),
+                content_title: Some(workflow.name.as_str().to_string()),
+                line: None,
+                column: None,
+                message: format!(
+                    "Workflow complexity ({complexity}) exceeds maximum ({})",
+                    self.config.max_workflow_complexity
+                ),
+                suggestion: Some(
+                    "Consider breaking down the workflow into smaller components".to_string(),
+                ),
+            });
+        }
+
         // Delegate to the workflow's self-validation
         let issues = workflow.validate(Some(workflow_path));
         for issue in issues {
@@ -270,6 +299,14 @@ impl Validator {
         result: &mut ValidationResult,
         content_title: Option<String>,
     ) {
+        // First validate content using the validation manager
+        let content_validation_result = self.validation_manager.validate_content(
+            &prompt.template,
+            file_path,
+            content_title.clone(),
+        );
+        result.merge(content_validation_result);
+
         // Try to render the template with partials support using the same path as test/serve
         let empty_args = std::collections::HashMap::new();
 
@@ -608,6 +645,107 @@ impl Validator {
 
         // Use the shared validation logic
         self.validate_workflow_structure(&workflow, workflow_path, result);
+    }
+
+    /// Validate sah.toml configuration file if it exists
+    fn validate_sah_config(&self, result: &mut ValidationResult) -> Result<()> {
+        use std::path::Path;
+        use swissarmyhammer::sah_config::ValidationError as ConfigValidationError;
+
+        // Check for sah.toml in the current directory
+        let config_path = Path::new("sah.toml");
+        if !config_path.exists() {
+            // No configuration file found - this is not an error
+            return Ok(());
+        }
+
+        result.files_checked += 1;
+
+        // Try to validate the configuration file
+        match validate_config_file(config_path) {
+            Ok(()) => {
+                if !self.quiet {
+                    let issue = ValidationIssue {
+                        level: ValidationLevel::Info,
+                        file_path: config_path.to_path_buf(),
+                        content_title: Some("sah.toml".to_string()),
+                        line: None,
+                        column: None,
+                        message: "Configuration file validation passed".to_string(),
+                        suggestion: None,
+                    };
+                    result.add_issue(issue);
+                }
+            }
+            Err(e) => {
+                // Convert configuration validation error to validation issue
+                let (level, message, suggestion) = match &e {
+                    ConfigValidationError::InvalidVariableName { name, reason } => (
+                        ValidationLevel::Error,
+                        format!("Invalid variable name '{name}': {reason}"),
+                        Some("Variable names must be valid Liquid identifiers (letters, numbers, underscores, starting with letter/underscore)".to_string()),
+                    ),
+                    ConfigValidationError::ReservedVariableName { name } => (
+                        ValidationLevel::Error,
+                        format!("Variable name '{name}' is reserved and cannot be used"),
+                        Some("Choose a different variable name that doesn't conflict with Liquid template keywords or SwissArmyHammer internals".to_string()),
+                    ),
+                    ConfigValidationError::StringTooLong { length, max_length } => (
+                        ValidationLevel::Error,
+                        format!("String value too long: {length} characters (max: {max_length})"),
+                        Some("Consider breaking long strings into smaller parts or storing them in external files".to_string()),
+                    ),
+                    ConfigValidationError::ArrayTooLarge { length, max_elements } => (
+                        ValidationLevel::Error,
+                        format!("Array too large: {length} elements (max: {max_elements})"),
+                        Some("Consider reducing the number of array elements or using nested structures".to_string()),
+                    ),
+                    ConfigValidationError::NestingTooDeep { depth, max_depth } => (
+                        ValidationLevel::Error,
+                        format!("Configuration nesting too deep: {depth} levels (max: {max_depth})"),
+                        Some("Flatten the configuration structure to reduce nesting levels".to_string()),
+                    ),
+                    ConfigValidationError::TooManyVariables { count, max_count } => (
+                        ValidationLevel::Error,
+                        format!("Too many configuration variables: {count} (max: {max_count})"),
+                        Some("Consider grouping related variables into tables or reducing the number of variables".to_string()),
+                    ),
+                    ConfigValidationError::RuleFailed { rule, message } => (
+                        ValidationLevel::Error,
+                        format!("Validation rule '{rule}' failed: {message}"),
+                        None,
+                    ),
+                    ConfigValidationError::PathTraversalAttack { path } => (
+                        ValidationLevel::Error,
+                        format!("Path traversal attack detected: {path}"),
+                        Some("Use relative paths within the project directory".to_string()),
+                    ),
+                    ConfigValidationError::InsufficientPermissions { path, reason } => (
+                        ValidationLevel::Warning,
+                        format!("File permission issue for '{path}': {reason}"),
+                        Some("Check file permissions and ownership".to_string()),
+                    ),
+                    ConfigValidationError::LoadError(msg) => (
+                        ValidationLevel::Error,
+                        format!("Configuration loading error: {msg}"),
+                        Some("Check TOML syntax and file accessibility".to_string()),
+                    ),
+                };
+
+                let issue = ValidationIssue {
+                    level,
+                    file_path: config_path.to_path_buf(),
+                    content_title: Some("sah.toml".to_string()),
+                    line: None, // We could enhance this to include line numbers from TOML parse errors
+                    column: None,
+                    message,
+                    suggestion,
+                };
+                result.add_issue(issue);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1135,6 +1273,7 @@ stateDiagram-v2
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_validate_command_loads_same_workflows_as_flow_list() {
         // This test ensures consistency between validate and flow list commands
         // Both should load workflows from the same standard locations
@@ -1526,13 +1665,15 @@ stateDiagram-v2
         )
         .unwrap();
 
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&temp_dir).unwrap();
+        let original_dir = std::env::current_dir().ok();
+        let _ = std::env::set_current_dir(&temp_dir);
 
         let mut result = ValidationResult::new();
         let _ = validator.validate_all_workflows(&mut result);
 
-        let _ = std::env::set_current_dir(original_dir);
+        if let Some(original_dir) = original_dir {
+            let _ = std::env::set_current_dir(original_dir);
+        }
         // With the new implementation using WorkflowResolver, workflows are only loaded
         // from standard locations (builtin, user ~/.swissarmyhammer/workflows, local ./.swissarmyhammer/workflows)
         // In a temp directory test environment, we might find the local workflow if the resolver

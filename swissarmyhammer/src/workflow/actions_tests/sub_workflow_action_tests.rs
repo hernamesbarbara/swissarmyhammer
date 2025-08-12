@@ -2,6 +2,7 @@
 
 use crate::workflow::actions::*;
 use serde_json::Value;
+use serial_test::serial;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -107,7 +108,11 @@ async fn test_sub_workflow_action_invalid_input_key() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_sub_workflow_action_empty_workflow_stack() {
+    // Clear any test storage that might have been set by other tests
+    crate::workflow::actions::clear_test_storage();
+
     let action = SubWorkflowAction::new("test-workflow".to_string());
     let mut context = HashMap::new();
 

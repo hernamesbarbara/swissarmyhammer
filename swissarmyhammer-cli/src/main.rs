@@ -1,6 +1,7 @@
 use std::process;
 mod cli;
 mod completions;
+mod config;
 mod doctor;
 mod error;
 mod exit_codes;
@@ -8,6 +9,7 @@ mod flow;
 mod issue;
 mod list;
 mod logging;
+mod mcp_integration;
 mod memo;
 // prompt_loader module removed - using SDK's PromptResolver directly
 mod prompt;
@@ -20,6 +22,7 @@ use clap::CommandFactory;
 use cli::{Cli, Commands};
 use exit_codes::{EXIT_ERROR, EXIT_SUCCESS, EXIT_WARNING};
 use logging::FileWriterGuard;
+use swissarmyhammer::SwissArmyHammerError;
 
 #[tokio::main]
 async fn main() {
@@ -159,6 +162,10 @@ async fn main() {
             tracing::info!("Running search command");
             run_search(subcommand).await
         }
+        Some(Commands::Config { subcommand }) => {
+            tracing::info!("Running config command");
+            run_config(subcommand).await
+        }
         None => {
             // This case is handled early above for performance
             unreachable!()
@@ -177,7 +184,8 @@ async fn main() {
 async fn run_server() -> i32 {
     use rmcp::serve_server;
     use rmcp::transport::io::stdio;
-    use swissarmyhammer::{mcp::McpServer, PromptLibrary};
+    use swissarmyhammer::PromptLibrary;
+    use swissarmyhammer_tools::McpServer;
 
     // Create library and server
     let library = PromptLibrary::new();
@@ -268,15 +276,16 @@ async fn run_flow(subcommand: cli::FlowSubcommand) -> i32 {
     match flow::run_flow_command(subcommand).await {
         Ok(_) => EXIT_SUCCESS,
         Err(e) => {
-            // Check if this is an abort error and use appropriate exit code
-            let error_msg = e.to_string();
-            if error_msg.contains("ABORT ERROR") {
-                tracing::error!("Flow execution aborted: {}", e);
-                EXIT_ERROR
-            } else {
-                tracing::error!("Flow error: {}", e);
-                EXIT_WARNING
+            // Check if this is an abort error (file-based detection)
+            if let SwissArmyHammerError::ExecutorError(
+                swissarmyhammer::workflow::ExecutorError::Abort(abort_reason),
+            ) = &e
+            {
+                tracing::error!("Workflow aborted: {}", abort_reason);
+                return EXIT_ERROR;
             }
+            tracing::error!("Flow error: {}", e);
+            EXIT_WARNING
         }
     }
 }
@@ -341,6 +350,18 @@ fn run_validate(quiet: bool, format: cli::ValidateFormat, workflow_dirs: Vec<Str
         Err(e) => {
             tracing::error!("Validate error: {}", e);
             EXIT_ERROR
+        }
+    }
+}
+
+async fn run_config(subcommand: cli::ConfigCommands) -> i32 {
+    use config;
+
+    match config::handle_config_command(subcommand).await {
+        Ok(_) => EXIT_SUCCESS,
+        Err(e) => {
+            tracing::error!("Config error: {}", e);
+            EXIT_WARNING
         }
     }
 }

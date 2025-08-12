@@ -1,6 +1,7 @@
 # Rust
-/target
+target
 **/*.rs.bk
+*.rcgu.o
 
 # Editor
 *.swp
@@ -42,3 +43,14 @@ proptest-regressions/
 
 swissarmyhammer/.swissarmyhammer
 swissarmyhammer-cli/.swissarmyhammer
+
+.work
+
+# SwissArmyHammer workflow runs (keep config files but ignore run history)
+.swissarmyhammer/workflow-runs/
+
+# SwissArmyHammer abort files (temporary test files)
+.swissarmyhammer/.abort
+
+# SwissArmyHammer temporary files
+.swissarmyhammer/tmp/

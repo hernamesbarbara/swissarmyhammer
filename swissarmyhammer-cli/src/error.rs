@@ -6,7 +6,7 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::exit_codes::{EXIT_ERROR, EXIT_SUCCESS};
+use crate::exit_codes::{EXIT_ERROR, EXIT_SUCCESS, EXIT_WARNING};
 
 /// CLI-specific result type that preserves error information
 pub type CliResult<T> = Result<T, CliError>;
@@ -29,25 +29,14 @@ impl CliError {
         }
     }
 
-    /// Create a CLI error from a SwissArmyHammer error, with proper exit code handling for abort errors
+    /// Create a CLI error from a SwissArmyHammer error
     #[allow(dead_code)]
     pub fn from_swissarmyhammer_error(error: swissarmyhammer::SwissArmyHammerError) -> Self {
-        // Check if this is an abort error by examining the error message
         let error_msg = error.to_string();
-        if error_msg.contains("ABORT ERROR") {
-            tracing::error!("Detected abort error, triggering immediate shutdown");
-            Self {
-                message: format!("Execution aborted: {error_msg}"),
-                exit_code: EXIT_ERROR,
-                source: Some(Box::new(error)),
-            }
-        } else {
-            // Regular error handling
-            Self {
-                message: error_msg,
-                exit_code: EXIT_ERROR,
-                source: Some(Box::new(error)),
-            }
+        Self {
+            message: error_msg,
+            exit_code: EXIT_ERROR,
+            source: Some(Box::new(error)),
         }
     }
 
@@ -86,6 +75,19 @@ pub fn handle_cli_result<T>(result: CliResult<T>) -> i32 {
         Err(e) => {
             tracing::error!("Error: {}", e.full_chain());
             e.exit_code
+        }
+    }
+}
+
+/// Convert MCP errors to CLI errors with appropriate exit codes
+impl From<rmcp::Error> for CliError {
+    fn from(error: rmcp::Error) -> Self {
+        let error_msg = error.to_string();
+        // Regular MCP error handling - use EXIT_WARNING for standard MCP errors
+        Self {
+            message: format!("MCP error: {error_msg}"),
+            exit_code: EXIT_WARNING,
+            source: Some(Box::new(error)),
         }
     }
 }

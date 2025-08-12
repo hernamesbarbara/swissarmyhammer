@@ -277,6 +277,9 @@ impl TestRunner {
             println!("{}", "─".repeat(50));
         }
 
+        // Note: ABORT ERROR string-based detection removed - abort handling now done via
+        // ExecutorError::Abort at the workflow execution level
+
         // Copy to clipboard if requested
         if copy {
             match arboard::Clipboard::new() {

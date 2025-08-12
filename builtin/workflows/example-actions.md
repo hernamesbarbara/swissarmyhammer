@@ -22,13 +22,14 @@ stateDiagram-v2
     SetVariable --> CheckValue
     CheckValue --> SuccessPath: success
     CheckValue --> FailurePath: failure
+    CheckValue --> FailurePath: default
     SuccessPath --> WaitExample
     FailurePath --> HandleError
     HandleError --> WaitExample
     WaitExample --> BranchDecision
-    BranchDecision --> Branch1: example_var.startsWith('Hello')
+    BranchDecision --> Branch1: example_var.startsWith("Hello")
     BranchDecision --> Branch2: is_error == true
-    BranchDecision --> DefaultBranch: always
+    BranchDecision --> DefaultBranch: default
     Branch1 --> Complete
     Branch2 --> Complete
     DefaultBranch --> Complete
@@ -49,8 +50,8 @@ The Actions section maps state names to their actions. Format: `- StateName: Act
 - HandleError: Log "Error has been handled"
 - WaitExample: Wait 2 seconds
 - BranchDecision: Set branch_value="${example_var}"
-- Branch1: Log "Branch 1 selected: ${branch_value} contains Hello"
-- Branch2: Log "Branch 2 selected: ${branch_value} is error state"
+- Branch1: Log "Branch 1 selected: {{branch_value}} contains Hello"
+- Branch2: Log "Branch 2 selected: {{branch_value}} is error state"
 - DefaultBranch: Log "Default branch selected"
 - Complete: Log "Workflow complete! Greeting was: ${greeting}"
 

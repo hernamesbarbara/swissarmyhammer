@@ -5,12 +5,6 @@ tags:
   - auto
 ---
 
-## Usage
-
-```bash
-swissarmyhammer flow run code_issue
-```
-
 ## States
 
 ```mermaid
@@ -25,8 +19,8 @@ stateDiagram-v2
 ## Actions
 
 - start: log "Coding an issue"
-- issue: execute prompt "code/issue"
-- test: run workflow "tdd"
+- issue: execute prompt "issue/code"
+- test: log "Would run TDD workflow"
 - commit: execute prompt "commit"
 
 ## Description

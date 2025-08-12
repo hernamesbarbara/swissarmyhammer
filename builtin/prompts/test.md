@@ -12,19 +12,29 @@ The goal is to have:
 {% render "principals" %}
 {% render "coding_standards" %}
 
-## Guidelines
+## Rules
 
 - Always run tests using a command line tool appropriate for the project
-- Corrections should be constructive, meaning 'just deleting code' is not an acceptable fix
 - YOU MUST debug the code to make all tests pass, only change tests as a last resort
-- Feel free to refactor
-- If tests take a 'long time' -- more than 2 minutes
+- Always have an extended timeout running tests of 10 minutes for the first try
+- If individual tests are identified as slow
   - check if any tests are hanging and correct them
-  - identify the slowest test and speed it up
+  - speed the tests up so they are no longer slow
+    - this may require decomposing a large slow test into multiple smaller tests
+- Corrections should be constructive
+  - do not comment out or ignore failing tests
+- Feel free to refactor
+
+### Rust
+
+- Run tests with `cargo nextest run`
 
 ## Process
 
 - run all tests
+- look at modified files on your current branch and figure out if you are resuming interrupted work
+- write all errors and warnings to a markdown scratchpad file `./TEST_FAILURES.md`, this is your todo list
+- if there is an existing `./TEST_FAILURES.md`, just append to it -- more work to do!
 {% render "todo", todo_file: "./TEST_FAILURES.md" %}
 
 ## Reporting

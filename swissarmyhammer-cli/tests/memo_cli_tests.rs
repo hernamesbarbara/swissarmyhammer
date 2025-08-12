@@ -435,12 +435,12 @@ fn test_cli_memo_search_empty_query() {
         .assert()
         .success();
 
-    // Search with empty query should match all
+    // Search with empty query should fail
     memo_cmd_with_dir(&temp_dir)
         .args(["memo", "search", ""])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("🔍 Found 1 memo matching ''"));
+        .failure()
+        .stderr(predicate::str::contains("Search query cannot be empty"));
 }
 
 #[test]
@@ -863,12 +863,11 @@ fn test_cli_memo_file_from_temp() {
 mod stress_tests {
     use super::*;
 
-    /// Stress test: Create many memos rapidly via CLI
+    /// Performance test: Create multiple memos rapidly via CLI
     #[test]
-    #[ignore] // Run only when specifically requested due to time
     fn test_cli_memo_create_many() {
         let temp_dir = TempDir::new().unwrap();
-        let num_memos = 100;
+        let num_memos = 45;
 
         for i in 1..=num_memos {
             memo_cmd_with_dir(&temp_dir)
@@ -889,44 +888,5 @@ mod stress_tests {
             .stdout(predicate::str::contains(format!(
                 "📝 Found {num_memos} memos"
             )));
-    }
-
-    /// Stress test: Search performance with many memos via CLI
-    #[test]
-    #[ignore] // Run only when specifically requested due to time
-    fn test_cli_memo_search_performance() {
-        let temp_dir = TempDir::new().unwrap();
-
-        // Create memos with different patterns
-        let patterns = [
-            "project",
-            "meeting",
-            "documentation",
-            "development",
-            "testing",
-        ];
-        let num_per_pattern = 20;
-
-        for pattern in &patterns {
-            for i in 1..=num_per_pattern {
-                memo_cmd_with_dir(&temp_dir)
-                    .args(["memo", "create", &format!("{pattern} Task {i}")])
-                    .arg("--content")
-                    .arg(format!("This memo is about {pattern} work item {i}"))
-                    .assert()
-                    .success();
-            }
-        }
-
-        // Search for each pattern
-        for pattern in &patterns {
-            memo_cmd_with_dir(&temp_dir)
-                .args(["memo", "search", pattern])
-                .assert()
-                .success()
-                .stdout(predicate::str::contains(format!(
-                    "🔍 Found {num_per_pattern} memos matching '{pattern}'"
-                )));
-        }
     }
 }

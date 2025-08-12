@@ -19,12 +19,16 @@ src/mcp/tools/
 
 ### Noun-Based Organization
 Tools are grouped by the resource they operate on:
+
+Examples:
 - `issues/` - Issue management tools
 - `memoranda/` - Memo management tools  
 - `search/` - Search functionality tools
 
 ### Verb-Based Submodules
 Each action on a resource gets its own submodule:
+
+Examples:
 - `issues/create/` - Create new issues
 - `issues/work/` - Start working on an issue
 - `issues/merge/` - Merge issue branches
